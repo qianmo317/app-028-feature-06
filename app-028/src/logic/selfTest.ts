@@ -2,6 +2,7 @@
  * 第 10 节验收标准的自动化断言（在浏览器里跑，结果直接显示在「裁切参数」页）
  */
 import { validateCutSequence, type CutLine, type Rect } from './guillotine'
+import { comparePapers, sortCompares } from './cost'
 import { BUILTIN_PAPERS, BUILTIN_PHOTO_SIZES } from './library'
 import { pack, sheetsFromPlacements, usableRegion, type PackGroup, type PackOptions } from './packer'
 import { buildPdf } from './pdf'
@@ -482,6 +483,106 @@ function assertPerformance(): AssertionResult {
   }
 }
 
+/** ⑧ 换纸试算：全部相纸参与（含卷筒/自定义/当前纸），放不下的给原因，三种排序正确 */
+function assertPaperCompare(): AssertionResult {
+  const t0 = performance.now()
+  const problems: string[] = []
+  const groups: PackGroup[] = [
+    { itemId: 'a', copies: 8, photoW: 25, photoH: 35, allowRotate: false, keepTogether: true },
+  ]
+  const opts = { safeEdgeMm: 3, gapMm: 0, kerfMm: 0.5, allowRotate: false }
+  const tiny: Paper = {
+    id: 'tiny',
+    name: '放不下的测试纸',
+    wMm: 20,
+    hMm: 20,
+    marginMm: 0,
+    priceCents: 10,
+    kind: 'sheet',
+  }
+  const customBig: Paper = {
+    id: 'cbig',
+    name: '自定义测试纸',
+    wMm: 400,
+    hMm: 500,
+    marginMm: 3,
+    priceCents: 900,
+    kind: 'sheet',
+  }
+  const papers = [...BUILTIN_PAPERS, tiny, customBig]
+  const list = comparePapers(groups, opts, papers, 'p5x7')
+
+  // 全部候选都在：内置 + 自定义 + 卷筒 + 当前纸 + 放不下的纸
+  if (list.length !== papers.length) {
+    problems.push(`候选应包含全部 ${papers.length} 种相纸，实际 ${list.length} 种`)
+  }
+  if (!list.find((c) => c.paper.id === 'p5x7')?.isCurrent) {
+    problems.push('当前在用的相纸没有标记在候选表里')
+  }
+  if (!list.find((c) => c.paper.id === 'cbig' && !c.error)) {
+    problems.push('自定义相纸未参与试算')
+  }
+
+  // 卷筒：参与试算，按预估用料给出米数、折算利用率与总价
+  const roll = list.find((c) => c.paper.kind === 'roll')
+  if (!roll) {
+    problems.push('卷筒相纸未参与试算')
+  } else if (roll.error) {
+    problems.push(`卷筒试算失败：${roll.error}`)
+  } else {
+    if (!roll.usedMeters || roll.usedMeters <= 0) problems.push('卷筒未给出预估用料米数')
+    const expectCents = Math.round((roll.paper.priceCents * (roll.usedLengthMm ?? 0)) / roll.paper.hMm)
+    if (roll.totalCents !== expectCents) {
+      problems.push(`卷筒总价未按用料长度折算：${roll.totalCents} ≠ ${expectCents}`)
+    }
+    const wholeRollUtil = (8 * 25 * 35) / (roll.paper.wMm * roll.paper.hMm)
+    if (roll.avgUtilization <= wholeRollUtil) {
+      problems.push('卷筒利用率仍按整卷长度计算，未按预估用料折算')
+    }
+  }
+
+  // 放不下的纸：留在表里并给出原因，而不是空数
+  const tinyRow = list.find((c) => c.paper.id === 'tiny')
+  if (!tinyRow) problems.push('放不下的相纸没有出现在候选表里')
+  else if (!tinyRow.error) problems.push('放不下的相纸没有给出原因')
+
+  // 三种排序
+  const w = { cost: 1, sheets: 1, cuts: 1, utilization: 1 }
+  const byPaper = sortCompares(list, 'savePaper', w)
+  const okRows = byPaper.filter((c) => !c.error)
+  for (let i = 1; i < okRows.length; i++) {
+    if (okRows[i].consumedAreaMm2 < okRows[i - 1].consumedAreaMm2 - 1e-6) {
+      problems.push('省纸优先排序不是按耗纸面积升序')
+      break
+    }
+  }
+  if (byPaper.length && byPaper[byPaper.length - 1].error !== tinyRow?.error) {
+    problems.push('放不下的相纸没有沉底')
+  }
+  const byTime = sortCompares(list, 'saveTime', w).filter((c) => !c.error)
+  for (let i = 1; i < byTime.length; i++) {
+    if (byTime[i].cutCount < byTime[i - 1].cutCount) {
+      problems.push('省时优先排序不是按预计刀数升序')
+      break
+    }
+  }
+  const byCustom = sortCompares(list, 'custom', { cost: 1, sheets: 0, cuts: 0, utilization: 0 })
+  const minCost = Math.min(...list.filter((c) => !c.error).map((c) => c.totalCents))
+  if (byCustom[0]?.totalCents !== minCost) {
+    problems.push('自定义权重全押总价时，总价最低的没有排在最前')
+  }
+  const rollIn = byPaper.find((c) => c.paper.kind === 'roll')
+  return {
+    id: 'compare',
+    title: '⑧ 换纸试算：全部相纸参与（含卷筒/自定义/当前纸），放不下的给原因，三种排序正确',
+    pass: problems.length === 0,
+    detail: problems.length
+      ? problems.join('；')
+      : `${list.length} 种相纸全部参与试算（含卷筒与自定义）；卷筒预估用料 ${rollIn?.usedMeters?.toFixed(2)}m、按用料折算总价 ${rollIn ? (rollIn.totalCents / 100).toFixed(2) : '—'} 元；放不下的「${tiny.name}」给出原因并沉底；省纸/省时/自定义权重三种排序均正确`,
+    ms: Math.round(performance.now() - t0),
+  }
+}
+
 export async function runSelfTest(): Promise<AssertionResult[]> {
   const results: AssertionResult[] = []
   results.push(assertGuillotine())
@@ -501,5 +602,6 @@ export async function runSelfTest(): Promise<AssertionResult[]> {
     })
   }
   results.push(assertPerformance())
+  results.push(assertPaperCompare())
   return results
 }

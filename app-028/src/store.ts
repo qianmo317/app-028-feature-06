@@ -15,6 +15,7 @@ import type {
   Leftover,
   Paper,
   PaperTemplate,
+  PaperVersionSnapshot,
   PhotoRef,
   PhotoSize,
   Placement,
@@ -201,6 +202,39 @@ export function setManual(task: Task, placements: Placement[]): void {
 
 export function resetManual(task: Task): void {
   task.manual = undefined
+  touch()
+}
+
+/** 换纸试算：一键切换到候选相纸并重排；切走之前那版留在 paperBackup 里 */
+export function switchTaskPaper(task: Task, paper: Paper): string | undefined {
+  task.paperBackup = {
+    paperId: task.paperId,
+    customPaper: task.customPaper ? { ...task.customPaper } : undefined,
+    result: task.result,
+    manual: task.manual,
+    savedAt: Date.now(),
+  }
+  task.paperId = paper.id
+  task.customPaper = undefined
+  return runPack(task)
+}
+
+/** 回到切走之前那版（与当前版互换，可来回切换） */
+export function restoreTaskPaper(task: Task): void {
+  const b = task.paperBackup
+  if (!b) return
+  const current: PaperVersionSnapshot = {
+    paperId: task.paperId,
+    customPaper: task.customPaper,
+    result: task.result,
+    manual: task.manual,
+    savedAt: Date.now(),
+  }
+  task.paperId = b.paperId
+  task.customPaper = b.customPaper
+  task.result = b.result
+  task.manual = b.manual
+  task.paperBackup = current
   touch()
 }
 

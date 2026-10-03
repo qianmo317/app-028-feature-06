@@ -241,6 +241,11 @@ input[type='checkbox'] {
   width: 15px;
   height: 15px;
 }
+input[type='radio'] {
+  accent-color: var(--brand);
+  width: 14px;
+  height: 14px;
+}
 input[type='range'] {
   accent-color: var(--brand);
   width: 100%;
@@ -337,6 +342,16 @@ table.data th.num {
 }
 table.data tr:hover td {
   background: #fbfcfe;
+}
+table.data tr.current td,
+table.data tr.current:hover td {
+  background: var(--brand-soft);
+}
+table.data td.err {
+  color: var(--danger);
+  font-size: 12.5px;
+  font-family: var(--font-sans);
+  text-align: left;
 }
 
 /* ---------- 徽标 / 提示 ---------- */

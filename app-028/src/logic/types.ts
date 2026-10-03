@@ -97,6 +97,24 @@ export interface PackResult {
   stats: PackStats
 }
 
+/** 手工微调结果（增量校验） */
+export interface ManualAdjust {
+  placements: Placement[]
+  valid: boolean
+  message: string
+  validationMs: number
+  stepCount: number
+}
+
+/** 换纸试算「一键切换」时留底的上一版（切走之前那版留着，方便回来） */
+export interface PaperVersionSnapshot {
+  paperId: string
+  customPaper?: Paper
+  result?: PackResult
+  manual?: ManualAdjust
+  savedAt: number
+}
+
 export interface CostReport {
   paperName: string
   sheets: number
@@ -126,13 +144,9 @@ export interface Task {
   footerText: string
   createdAt: number
   /** 手工微调过的排样（存在时优先于自动排样结果） */
-  manual?: {
-    placements: Placement[]
-    valid: boolean
-    message: string
-    validationMs: number
-    stepCount: number
-  }
+  manual?: ManualAdjust
+  /** 换纸试算切走之前留底的上一版（可一键切回，与当前版互换） */
+  paperBackup?: PaperVersionSnapshot
   result?: PackResult
 }
 

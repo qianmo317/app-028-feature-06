@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SheetView from '../components/SheetView.vue'
 import UtilizationBar from '../components/UtilizationBar.vue'
@@ -11,14 +11,16 @@ import {
   makeThumbResolver,
   manualPlacementsOf,
   resetManual,
+  restoreTaskPaper,
   setManual,
   sheetsOf,
   photoVersion,
+  switchTaskPaper,
 } from '../store'
-import { comparePapers, computeCost } from '../logic/cost'
+import { comparePapers, computeCost, sortCompares } from '../logic/cost'
 import { findPhotoSize, groupsFromTask, resolvePaper, sizeLabel } from '../logic/library'
 import { formatCents, formatPercent } from '../logic/units'
-import type { PaperCompare } from '../logic/cost'
+import type { CompareSortMode, CompareWeights, PaperCompare } from '../logic/cost'
 import type { Placement, Task } from '../logic/types'
 
 const route = useRoute()
@@ -68,6 +70,19 @@ const scale = computed(() => {
 
 const comparisons = ref<PaperCompare[]>([])
 const compareError = ref('')
+const sortMode = ref<CompareSortMode>('savePaper')
+const weights = reactive<CompareWeights>({ cost: 1, sheets: 1, cuts: 1, utilization: 1 })
+
+/** 排序后的候选表（摆不下的纸沉底并带原因） */
+const sortedComparisons = computed(() => sortCompares(comparisons.value, sortMode.value, weights))
+
+/** 切走之前留底的那版相纸名 */
+const backupPaperName = computed(() => {
+  const b = task.value?.paperBackup
+  if (!b) return ''
+  if (b.paperId === 'custom' && b.customPaper) return b.customPaper.name
+  return allPapers.value.find((p) => p.id === b.paperId)?.name ?? b.paperId
+})
 
 function runCompare() {
   const t = task.value
@@ -76,8 +91,13 @@ function runCompare() {
   const groups = groupsFromTask(t, allSizes.value)
   if (!groups.length) {
     compareError.value = '清单为空'
+    comparisons.value = []
     return
   }
+  // 全部相纸（内置 + 自定义 + 卷筒）都参与；当前在用的这张也列进表里作基准
+  const papers = allPapers.value.slice()
+  const cur = paper.value
+  if (!papers.some((p) => p.id === cur.id)) papers.unshift(cur)
   comparisons.value = comparePapers(
     groups,
     {
@@ -86,9 +106,34 @@ function runCompare() {
       kerfMm: t.kerfMm,
       allowRotate: t.allowRotate,
     },
-    allPapers.value.filter((x) => x.id !== 'proll152'),
-    t.paperId,
+    papers,
+    cur.id,
   )
+}
+
+/** 一键切到候选相纸重排；切走之前那版留底，方便回来 */
+function applyPaper(c: PaperCompare) {
+  const t = task.value
+  if (!t || c.error || c.isCurrent) return
+  const err = switchTaskPaper(t, c.paper)
+  if (err) {
+    compareError.value = err
+    return
+  }
+  activeSheet.value = 0
+  selectedSeq.value = -1
+  localMsg.value = `已切换到「${c.paper.name}」并重排；切走之前那版已留底，可随时切回`
+}
+
+/** 回到切走之前那版（与当前版互换，可来回切换） */
+function restoreBackup() {
+  const t = task.value
+  if (!t?.paperBackup) return
+  const name = backupPaperName.value
+  restoreTaskPaper(t)
+  activeSheet.value = 0
+  selectedSeq.value = -1
+  localMsg.value = `已回到「${name}」那一版（现在这版也已留底，可再切回）`
 }
 
 function onMove(payload: { seq: number; x: number; y: number }) {
@@ -248,13 +293,12 @@ function goto(routeName: string) {
   if (t) router.push(`/${routeName}/${t.id}`)
 }
 
-// 利用率低于 70% 时自动试算其它相纸规格做对比
+// 排样结果变化后自动重算换纸试算（全部相纸都参与，含卷筒与自定义）
 watch(
   () => task.value?.result,
   () => {
     const t = task.value
-    if (!t?.result) return
-    if (t.result.stats.avgUtilization >= 0.7) {
+    if (!t?.result) {
       comparisons.value = []
       return
     }
@@ -392,33 +436,102 @@ watch(
           </div>
         </div>
 
-        <div v-if="lowUtil" class="card">
+        <div class="card">
           <h3>换纸试算</h3>
-          <div class="note warn">
-            当前利用率低于 70%，建议换更大/更小的纸张试试（点下方按钮试算 2~3 种规格）
+          <div class="card-sub">
+            全部相纸（含卷筒与自定义）都参与试算；点「切换重排」一键换纸，切走之前那版会留底
+          </div>
+          <div v-if="lowUtil" class="note warn">
+            当前利用率低于 70%，建议换更大/更小的纸张试试
+          </div>
+          <div v-if="task.paperBackup" class="note ok">
+            切走之前那版（{{ backupPaperName }}）已留底
+            <button class="btn small" style="margin-left: 8px" @click="restoreBackup">
+              ← 回到那版
+            </button>
+            <span style="margin-left: 6px">（再按一次可切回现在这版）</span>
           </div>
           <div class="row" style="margin-top: 8px">
-            <button class="btn small" @click="runCompare">试算其它相纸</button>
+            <span style="font-size: 12.5px; color: var(--ink-3)">排序</span>
+            <label class="check">
+              <input v-model="sortMode" type="radio" value="savePaper" />
+              省纸优先（耗纸最少）
+            </label>
+            <label class="check">
+              <input v-model="sortMode" type="radio" value="saveTime" />
+              省时优先（刀数最少）
+            </label>
+            <label class="check">
+              <input v-model="sortMode" type="radio" value="custom" />
+              自定义权重
+            </label>
+            <div class="spacer"></div>
+            <button class="btn small" @click="runCompare">重新试算</button>
             <span v-if="compareError" class="badge danger">{{ compareError }}</span>
           </div>
-          <table v-if="comparisons.length" class="data" style="margin-top: 8px">
+          <div v-if="sortMode === 'custom'" class="row" style="margin-top: 4px">
+            <label class="field" style="max-width: 104px">
+              总价权重
+              <input v-model.number="weights.cost" type="number" min="0" step="0.5" />
+            </label>
+            <label class="field" style="max-width: 104px">
+              张数权重
+              <input v-model.number="weights.sheets" type="number" min="0" step="0.5" />
+            </label>
+            <label class="field" style="max-width: 104px">
+              刀数权重
+              <input v-model.number="weights.cuts" type="number" min="0" step="0.5" />
+            </label>
+            <label class="field" style="max-width: 104px">
+              利用率权重
+              <input v-model.number="weights.utilization" type="number" min="0" step="0.5" />
+            </label>
+          </div>
+          <table v-if="sortedComparisons.length" class="data" style="margin-top: 8px">
             <thead>
               <tr>
                 <th>相纸</th>
+                <th class="num">单价</th>
                 <th class="num">张数</th>
                 <th class="num">利用率</th>
+                <th class="num">预计刀数</th>
                 <th class="num">总价</th>
+                <th class="num">预估用料</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="c in comparisons" :key="c.paper.id">
-                <td>{{ c.paper.name }}</td>
-                <td class="num">{{ c.sheets }}</td>
-                <td class="num">{{ formatPercent(c.avgUtilization) }}</td>
-                <td class="num">{{ formatCents(c.totalCents) }}</td>
+              <tr v-for="c in sortedComparisons" :key="c.paper.id" :class="{ current: c.isCurrent }">
+                <td>
+                  {{ c.paper.name }}
+                  <span v-if="c.isCurrent" class="badge brand">当前</span>
+                  <span v-if="c.paper.kind === 'roll'" class="badge">卷筒</span>
+                </td>
+                <td class="num">
+                  {{ formatCents(c.paper.priceCents) }}{{ c.paper.kind === 'roll' ? '/卷' : '/张' }}
+                </td>
+                <template v-if="!c.error">
+                  <td class="num">{{ c.sheets }}{{ c.paper.kind === 'roll' ? ' 段' : '' }}</td>
+                  <td class="num">{{ formatPercent(c.avgUtilization) }}</td>
+                  <td class="num">{{ c.cutCount }}</td>
+                  <td class="num">{{ formatCents(c.totalCents) }}</td>
+                  <td class="num">
+                    {{ c.usedMeters != null ? `约 ${c.usedMeters.toFixed(2)} m` : '—' }}
+                  </td>
+                  <td>
+                    <span v-if="c.isCurrent" class="badge">使用中</span>
+                    <button v-else class="btn small" @click="applyPaper(c)">切换重排</button>
+                  </td>
+                </template>
+                <template v-else>
+                  <td colspan="6" class="err">摆不下：{{ c.error }}</td>
+                </template>
               </tr>
             </tbody>
           </table>
+          <div v-else class="note" style="margin-top: 8px">
+            尚未试算：先完成排样，或点「重新试算」
+          </div>
         </div>
 
         <div class="card">
