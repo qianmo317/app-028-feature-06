@@ -338,6 +338,12 @@ table.data th.num {
 table.data tr:hover td {
   background: #fbfcfe;
 }
+table.data tr.row-current td {
+  background: #eef4ff;
+}
+table.data tr.row-infeasible td {
+  color: var(--ink-3);
+}
 
 /* ---------- 徽标 / 提示 ---------- */
 .badge {

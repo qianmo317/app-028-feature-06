@@ -46,6 +46,11 @@ export function formatMm(n: number, digits = 1): string {
   return `${round(n, digits)}mm`
 }
 
+/** mm -> m（卷筒纸消耗长度用） */
+export function formatMeters(mm: number, digits = 2): string {
+  return `${(mm / 1000).toFixed(digits)}m`
+}
+
 export function formatCents(cents: number): string {
   return `¥${(cents / 100).toFixed(2)}`
 }

@@ -14,6 +14,7 @@ import { loadJSON, saveJSON } from './logic/storage'
 import type {
   Leftover,
   Paper,
+  PaperSnapshot,
   PaperTemplate,
   PhotoRef,
   PhotoSize,
@@ -202,6 +203,74 @@ export function setManual(task: Task, placements: Placement[]): void {
 export function resetManual(task: Task): void {
   task.manual = undefined
   touch()
+}
+
+const HISTORY_LIMIT = 8
+
+/** 任务当前版面的快照（换纸前留存，方便一键回来） */
+function snapshotOf(task: Task, label: string): PaperSnapshot {
+  return {
+    paperId: task.paperId,
+    customPaper: task.customPaper ? JSON.parse(JSON.stringify(task.customPaper)) : undefined,
+    result: task.result ? JSON.parse(JSON.stringify(task.result)) : undefined,
+    manual: task.manual ? JSON.parse(JSON.stringify(task.manual)) : undefined,
+    label,
+    createdAt: Date.now(),
+  }
+}
+
+/**
+ * 一键换成另一种纸：当前版面（含手工微调结果）原样存入任务内的版本历史，
+ * 然后按新纸重新排样。返回错误提示（无错误时返回 undefined）。
+ */
+export function switchTaskPaper(
+  task: Task,
+  paperId: string,
+  customPaper?: Paper,
+): string | undefined {
+  const oldPaper = resolvePaper(task, allPapers.value)
+  task.paperHistory = [...(task.paperHistory ?? []), snapshotOf(task, oldPaper.name)].slice(
+    -HISTORY_LIMIT,
+  )
+  task.paperId = paperId
+  task.customPaper = customPaper ? JSON.parse(JSON.stringify(customPaper)) : undefined
+  const err = runPack(task)
+  if (err) return err
+  return undefined
+}
+
+/**
+ * 回到版本历史中的某一版（被越过的版本全部保留，方便来回切）。
+ * 返回错误提示（无错误时返回 undefined）。
+ */
+export function restorePaperSnapshot(task: Task, index: number): string | undefined {
+  const history = task.paperHistory ?? []
+  const target = history[index]
+  if (!target) return '历史版本不存在'
+  const currentPaper = resolvePaper(task, allPapers.value)
+  const currentSnapshot = snapshotOf(task, currentPaper.name)
+  // 当前版本放到被点版本之后；被点版本之前的历史原样保留
+  const kept = history.slice(0, index)
+  task.paperHistory = [...kept, currentSnapshot].slice(-HISTORY_LIMIT)
+  task.paperId = target.paperId
+  task.customPaper = target.customPaper
+    ? JSON.parse(JSON.stringify(target.customPaper))
+    : undefined
+  task.result = target.result ? JSON.parse(JSON.stringify(target.result)) : undefined
+  task.manual = target.manual ? JSON.parse(JSON.stringify(target.manual)) : undefined
+  // 自定义纸可能已被删除：解析不到时兜底到第一张内置纸
+  if (target.paperId !== 'custom' && !findPaperById(target.paperId)) {
+    task.paperId = allPapers.value[0]?.id ?? 'p5x7'
+    task.customPaper = undefined
+    const err = runPack(task)
+    return err
+  }
+  touch()
+  return undefined
+}
+
+function findPaperById(id: string): Paper | undefined {
+  return allPapers.value.find((p) => p.id === id)
 }
 
 export function addCustomPaper(p: Omit<Paper, 'id'>): Paper {

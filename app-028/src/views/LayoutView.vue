@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SheetView from '../components/SheetView.vue'
 import UtilizationBar from '../components/UtilizationBar.vue'
@@ -11,14 +11,22 @@ import {
   makeThumbResolver,
   manualPlacementsOf,
   resetManual,
+  restorePaperSnapshot,
   setManual,
   sheetsOf,
+  switchTaskPaper,
   photoVersion,
 } from '../store'
-import { comparePapers, computeCost } from '../logic/cost'
+import {
+  comparePapers,
+  computeCost,
+  sortComparisons,
+  type CompareSortMode,
+  type PaperCompare,
+  type TrialWeights,
+} from '../logic/cost'
 import { findPhotoSize, groupsFromTask, resolvePaper, sizeLabel } from '../logic/library'
-import { formatCents, formatPercent } from '../logic/units'
-import type { PaperCompare } from '../logic/cost'
+import { formatCents, formatMeters, formatPercent } from '../logic/units'
 import type { Placement, Task } from '../logic/types'
 
 const route = useRoute()
@@ -68,16 +76,39 @@ const scale = computed(() => {
 
 const comparisons = ref<PaperCompare[]>([])
 const compareError = ref('')
+const sortMode = ref<CompareSortMode>('paper')
+const weights = reactive<TrialWeights>({ cost: 2, paper: 5, time: 1 })
+
+/** 试算候选：内置 + 自定义 + 卷筒；当前任务若是未入库的自定义纸也要参与 */
+function candidatePapers(t: Task) {
+  const list = allPapers.value.slice()
+  if (
+    t.paperId === 'custom' &&
+    t.customPaper &&
+    !list.some(
+      (p) =>
+        p.id === 'custom' &&
+        p.wMm === t.customPaper!.wMm &&
+        p.hMm === t.customPaper!.hMm &&
+        p.name === t.customPaper!.name,
+    )
+  ) {
+    list.push(t.customPaper)
+  }
+  return list
+}
 
 function runCompare() {
   const t = task.value
-  if (!t) return
+  if (!t?.result) return
   compareError.value = ''
   const groups = groupsFromTask(t, allSizes.value)
   if (!groups.length) {
     compareError.value = '清单为空'
+    comparisons.value = []
     return
   }
+  const currentPaper = resolvePaper(t, allPapers.value)
   comparisons.value = comparePapers(
     groups,
     {
@@ -86,9 +117,43 @@ function runCompare() {
       kerfMm: t.kerfMm,
       allowRotate: t.allowRotate,
     },
-    allPapers.value.filter((x) => x.id !== 'proll152'),
+    candidatePapers(t),
     t.paperId,
+    { paper: currentPaper, result: t.result },
   )
+}
+
+const sortedComparisons = computed(() =>
+  sortComparisons(comparisons.value, sortMode.value, weights),
+)
+
+function doSwitch(c: PaperCompare) {
+  const t = task.value
+  if (!t || c.isCurrent || !c.feasible) return
+  const custom = c.paper.id === 'custom' ? c.paper : undefined
+  const err = switchTaskPaper(t, c.paper.id, custom)
+  compareError.value = err ?? ''
+  activeSheet.value = 0
+  selectedSeq.value = -1
+}
+
+function doRestore(index: number) {
+  const t = task.value
+  if (!t) return
+  const err = restorePaperSnapshot(t, index)
+  compareError.value = err ?? ''
+  activeSheet.value = 0
+  selectedSeq.value = -1
+}
+
+function unitPriceLabel(c: PaperCompare): string {
+  if (!c.m) return '—'
+  return c.m.isRoll ? `${formatCents(c.m.unitPriceCents)}/米` : `${formatCents(c.m.unitPriceCents)}/张`
+}
+
+function sheetsLabel(c: PaperCompare): string {
+  if (!c.m) return '—'
+  return c.m.isRoll ? `${c.m.sheets} 段` : `${c.m.sheets} 张`
 }
 
 function onMove(payload: { seq: number; x: number; y: number }) {
@@ -248,16 +313,21 @@ function goto(routeName: string) {
   if (t) router.push(`/${routeName}/${t.id}`)
 }
 
-// 利用率低于 70% 时自动试算其它相纸规格做对比
+// 换纸试算：任务或排样结果一变（含换纸/回退）就把店里所有相纸重新试算一遍；
+// 手工微调不改变 result，不会触发重算（需要时点「重新试算」）
+const compareSig = ref('')
 watch(
   () => task.value?.result,
   () => {
     const t = task.value
-    if (!t?.result) return
-    if (t.result.stats.avgUtilization >= 0.7) {
+    if (!t?.result) {
       comparisons.value = []
+      compareSig.value = ''
       return
     }
+    const sig = `${t.id}|${t.paperId}|${t.result.stats.sheets}|${t.result.stats.totalPhotos}`
+    if (sig === compareSig.value) return
+    compareSig.value = sig
     runCompare()
   },
   { immediate: true },
@@ -282,6 +352,127 @@ watch(
     </div>
 
     <div v-if="localMsg" class="note">{{ localMsg }}</div>
+
+    <div class="card">
+      <h3>
+        换纸试算
+        <span class="row tight">
+          <span class="badge">共 {{ sortedComparisons.length }} 种候选（含卷筒/自定义）</span>
+          <button class="btn small" @click="runCompare">重新试算</button>
+        </span>
+      </h3>
+      <div class="card-sub">
+        所有在库相纸（含卷筒、自定义）与当前正用的纸都参与试算；卷筒按预估消耗长度折算总价，
+        刀数为共边合并后的贯通刀数。点「换用」即按该纸重排，切走前的版面（含手工微调）会留在下方历史里可一键回来。
+      </div>
+
+      <div v-if="lowUtil" class="note warn" style="margin-top: 8px">
+        当前利用率低于 70%，可在下表按省纸优先挑选利用率更高的纸张
+      </div>
+      <div v-if="compareError" class="note danger" style="margin-top: 8px">{{ compareError }}</div>
+
+      <div class="row" style="margin-top: 10px; gap: 12px">
+        <label class="field" style="max-width: 300px">
+          排序方式
+          <select v-model="sortMode">
+            <option value="paper">省纸优先（利用率高 → 便宜 → 刀少）</option>
+            <option value="time">省时优先（刀少 → 张数少 → 便宜）</option>
+            <option value="custom">自定义权重</option>
+          </select>
+        </label>
+        <div v-if="sortMode === 'custom'" class="row" style="gap: 14px">
+          <label class="check" style="white-space: nowrap">
+            省钱 <input v-model.number="weights.cost" type="number" min="0" max="10" step="1" style="width: 56px" />
+          </label>
+          <label class="check" style="white-space: nowrap">
+            省纸 <input v-model.number="weights.paper" type="number" min="0" max="10" step="1" style="width: 56px" />
+          </label>
+          <label class="check" style="white-space: nowrap">
+            省时 <input v-model.number="weights.time" type="number" min="0" max="10" step="1" style="width: 56px" />
+          </label>
+        </div>
+      </div>
+
+      <div v-if="task.paperHistory?.length" class="row" style="margin-top: 10px">
+        <span class="badge">换纸历史（点击回来）：</span>
+        <button
+          v-for="(h, i) in task.paperHistory"
+          :key="i"
+          class="btn small"
+          @click="doRestore(i)"
+        >
+          ↩ {{ h.label }}
+        </button>
+      </div>
+
+      <div style="overflow-x: auto; margin-top: 10px">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>相纸</th>
+              <th class="num">单价</th>
+              <th class="num">用纸</th>
+              <th class="num">卷筒用料</th>
+              <th class="num">利用率</th>
+              <th class="num">总价</th>
+              <th class="num">预计刀数</th>
+              <th>状态 / 原因</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="c in sortedComparisons"
+              :key="`${c.paper.id}@${c.paper.wMm}x${c.paper.hMm}`"
+              :class="{ 'row-current': c.isCurrent, 'row-infeasible': !c.feasible }"
+            >
+              <td>
+                {{ c.paper.name }}
+                <span v-if="c.m?.isRoll" class="badge">卷筒</span>
+                <span v-else-if="c.paper.id === 'custom'" class="badge brand">自定义</span>
+              </td>
+              <td class="num">{{ c.feasible ? unitPriceLabel(c) : '—' }}</td>
+              <td class="num">{{ c.feasible ? sheetsLabel(c) : '—' }}</td>
+              <td class="num">
+                <template v-if="c.feasible && c.m?.isRoll">{{ formatMeters(c.m.usedLengthMm ?? 0) }}</template>
+                <template v-else>—</template>
+              </td>
+              <td class="num">{{ c.feasible ? formatPercent(c.m!.utilization) : '—' }}</td>
+              <td class="num">{{ c.feasible ? formatCents(c.m!.totalCents) : '—' }}</td>
+              <td
+                class="num"
+                :title="c.feasible ? `未合并刀口 ${c.m!.rawCuts} 刀` : ''"
+              >
+                {{ c.feasible ? `${c.m!.cuts} 刀` : '—' }}
+              </td>
+              <td>
+                <span v-if="c.isCurrent" class="badge brand">当前正用</span>
+                <span v-else-if="!c.feasible" class="note danger" style="white-space: normal">
+                  摆不下：{{ c.reason }}
+                </span>
+                <span v-else class="badge ok">可换用</span>
+              </td>
+              <td>
+                <button
+                  v-if="!c.isCurrent && c.feasible"
+                  class="btn small primary"
+                  @click="doSwitch(c)"
+                >
+                  换用 →
+                </button>
+                <button
+                  v-else-if="c.isCurrent && task.paperHistory?.length"
+                  class="btn small"
+                  @click="doRestore(task.paperHistory.length - 1)"
+                >
+                  ↩ 切回上一版
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
     <div
       v-if="manual"
       class="note"
@@ -392,42 +583,21 @@ watch(
           </div>
         </div>
 
-        <div v-if="lowUtil" class="card">
-          <h3>换纸试算</h3>
-          <div class="note warn">
-            当前利用率低于 70%，建议换更大/更小的纸张试试（点下方按钮试算 2~3 种规格）
-          </div>
-          <div class="row" style="margin-top: 8px">
-            <button class="btn small" @click="runCompare">试算其它相纸</button>
-            <span v-if="compareError" class="badge danger">{{ compareError }}</span>
-          </div>
-          <table v-if="comparisons.length" class="data" style="margin-top: 8px">
-            <thead>
-              <tr>
-                <th>相纸</th>
-                <th class="num">张数</th>
-                <th class="num">利用率</th>
-                <th class="num">总价</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="c in comparisons" :key="c.paper.id">
-                <td>{{ c.paper.name }}</td>
-                <td class="num">{{ c.sheets }}</td>
-                <td class="num">{{ formatPercent(c.avgUtilization) }}</td>
-                <td class="num">{{ formatCents(c.totalCents) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
         <div class="card">
           <h3>成本核算</h3>
           <div v-if="cost" class="kv">
             <dt>相纸单价</dt>
-            <dd>{{ formatCents(paper.priceCents) }}/张</dd>
-            <dt>用纸张数</dt>
-            <dd>{{ cost.sheets }}</dd>
+            <dd>
+              {{ formatCents(paper.priceCents) }}/{{ paper.kind === 'roll' ? '卷' : '张' }}
+            </dd>
+            <template v-if="cost.usedLengthMm !== undefined">
+              <dt>预估消耗</dt>
+              <dd>{{ formatMeters(cost.usedLengthMm) }}（{{ cost.sheets }} 段）</dd>
+            </template>
+            <template v-else>
+              <dt>用纸张数</dt>
+              <dd>{{ cost.sheets }}</dd>
+            </template>
             <dt>总材料成本</dt>
             <dd>{{ formatCents(cost.totalCents) }}</dd>
             <dt>每张照片摊薄</dt>

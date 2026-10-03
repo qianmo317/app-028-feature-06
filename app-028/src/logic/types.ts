@@ -109,6 +109,19 @@ export interface CostReport {
   naiveWasteRate: number
   naiveTotalCents: number
   savedCents: number
+  /** 卷筒纸按实际消耗长度计价时的消耗量（mm）；单张纸为 undefined */
+  usedLengthMm?: number
+}
+
+/** 换纸前留存的一个版面版本（试算切纸后可一键回来） */
+export interface PaperSnapshot {
+  paperId: string
+  /** 自定义相纸（paperId 为 'custom' 时生效） */
+  customPaper?: Paper
+  result?: PackResult
+  manual?: Task['manual']
+  label: string
+  createdAt: number
 }
 
 export interface Task {
@@ -134,6 +147,8 @@ export interface Task {
     stepCount: number
   }
   result?: PackResult
+  /** 换纸历史：索引 0 为最早版本，末尾为上一次换纸前的版本 */
+  paperHistory?: PaperSnapshot[]
 }
 
 export interface Leftover {

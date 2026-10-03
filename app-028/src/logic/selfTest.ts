@@ -2,6 +2,12 @@
  * 第 10 节验收标准的自动化断言（在浏览器里跑，结果直接显示在「裁切参数」页）
  */
 import { validateCutSequence, type CutLine, type Rect } from './guillotine'
+import {
+  comparePapers,
+  metricsFromResult,
+  rollLengthCents,
+  sortComparisons,
+} from './cost'
 import { BUILTIN_PAPERS, BUILTIN_PHOTO_SIZES } from './library'
 import { pack, sheetsFromPlacements, usableRegion, type PackGroup, type PackOptions } from './packer'
 import { buildPdf } from './pdf'
@@ -482,6 +488,114 @@ function assertPerformance(): AssertionResult {
   }
 }
 
+/** ⑧ 换纸试算：卷筒/自定义/当前纸全部参与；卷筒按消耗米数计价；摆不下写明原因；排序与历史 */
+function assertPaperTrial(): AssertionResult {
+  const t0 = performance.now()
+  const problems: string[] = []
+
+  const roll = BUILTIN_PAPERS.find((p) => p.kind === 'roll') as Paper
+  const opts: Omit<PackOptions, 'paperW' | 'paperH' | 'marginMm'> = {
+    safeEdgeMm: 3,
+    gapMm: 0,
+    kerfMm: 0.5,
+    allowRotate: true,
+  }
+  // 6 寸照片一批：卷筒能排，单张小纸摆不下
+  const groups: PackGroup[] = [
+    { itemId: 'r6', copies: 40, photoW: 102, photoH: 152, allowRotate: true, keepTogether: false },
+  ]
+  const rollOut = pack(groups, {
+    ...opts,
+    paperW: roll.wMm,
+    paperH: roll.hMm,
+    marginMm: roll.marginMm,
+  })
+  if (rollOut.error) {
+    problems.push(`卷筒试算排样失败：${rollOut.error}`)
+  } else {
+    const m = metricsFromResult(roll, rollOut.result)
+    if (!m.isRoll || m.usedLengthMm === undefined) problems.push('卷筒指标未识别为卷筒')
+    if (m.usedLengthMm !== undefined) {
+      if (!(m.usedLengthMm > 0) || m.usedLengthMm > roll.hMm * m.sheets + EPS) {
+        problems.push(`卷筒消耗长度异常：${m.usedLengthMm}mm`)
+      }
+      const expect = rollLengthCents(roll, m.usedLengthMm)
+      if (Math.abs(m.totalCents - expect) > 0.011) {
+        problems.push(`卷筒总价未按消耗长度折算：${m.totalCents} vs ${expect}`)
+      }
+      if (m.unitPriceCents <= 0) problems.push('卷筒每米单价应大于 0')
+      if (!(m.utilization > 0 && m.utilization <= 1 + 1e-6)) {
+        problems.push(`卷筒利用率应在 (0,1]：${m.utilization}`)
+      }
+    }
+    if (m.cuts <= 0) problems.push('卷筒预计刀数应大于 0')
+  }
+
+  // 全量试算：内置纸（含卷筒）+ 一张明显摆不下的自定义小纸
+  const tiny: Paper = {
+    id: 'custom',
+    name: '试算用极小纸',
+    wMm: 30,
+    hMm: 40,
+    marginMm: 1,
+    priceCents: 50,
+    kind: 'sheet',
+  }
+  const current = BUILTIN_PAPERS.find((p) => p.id === 'p12x18') as Paper
+  const curOut = pack(groups, {
+    ...opts,
+    paperW: current.wMm,
+    paperH: current.hMm,
+    marginMm: current.marginMm,
+  })
+  if (curOut.error) problems.push(`基准纸排样失败：${curOut.error}`)
+  const list = comparePapers(
+    groups,
+    opts,
+    [...BUILTIN_PAPERS, tiny],
+    current.id,
+    { paper: current, result: curOut.result },
+  )
+  if (list.length !== BUILTIN_PAPERS.length + 1) problems.push('试算漏掉了候选纸（卷筒/自定义应全部参与）')
+  const curRow = list.find((c) => c.paper.id === current.id)
+  if (!curRow?.isCurrent || !curRow.feasible) problems.push('当前正用的纸应作为基准行保留并标记为当前')
+  if (!list.some((c) => c.paper.kind === 'roll' && c.feasible)) problems.push('卷筒纸应可行且参与试算')
+  const tinyRow = list.find((c) => c.paper.id === 'custom')
+  if (!tinyRow || tinyRow.feasible || !tinyRow.reason) {
+    problems.push('摆不下的纸应保留一行并写明原因，而不是给空数或被剔除')
+  }
+
+  // 排序稳定性：省纸优先首行利用率最高；省时优先首行刀数最少
+  const feasible = list.filter((c) => c.feasible)
+  const byPaper = sortComparisons(list, 'paper', { cost: 1, paper: 1, time: 1 })
+  const maxUtil = Math.max(...feasible.map((c) => c.m!.utilization))
+  if (byPaper[0].m!.utilization < maxUtil - 1e-9) problems.push('省纸优先应把利用率最高的排第一')
+  const byTime = sortComparisons(list, 'time', { cost: 1, paper: 1, time: 1 })
+  const minCuts = Math.min(...feasible.map((c) => c.m!.cuts))
+  if (byTime[0].m!.cuts !== minCuts) problems.push('省时优先应把刀数最少的排第一')
+  const byCustom = sortComparisons(list, 'custom', { cost: 10, paper: 0, time: 0 })
+  const minCost = Math.min(...feasible.map((c) => c.m!.totalCents))
+  if (byCustom[0].m!.totalCents > minCost + 1e-6) problems.push('自定义权重（全给省钱）应把最便宜的排第一')
+  // 不可行行永远沉底
+  if (byPaper.some((c, i) => !c.feasible && byPaper.slice(i + 1).some((d) => d.feasible))) {
+    problems.push('摆不下的纸应排在表格末尾')
+  }
+
+  return {
+    id: 'trial',
+    title: '⑧ 换纸试算：卷筒/自定义/当前纸全参与；卷筒按米计价；摆不下写明原因；三种排序',
+    pass: problems.length === 0,
+    detail: problems.length
+      ? problems.join('；')
+      : `卷筒 40 张 6 寸：消耗 ${
+          metricsFromResult(roll, rollOut.result).usedLengthMm
+        }mm，按米折算 ¥${(
+          metricsFromResult(roll, rollOut.result).totalCents / 100
+        ).toFixed(2)}；${BUILTIN_PAPERS.length + 1} 种候选全部在列，极小纸以「摆不下」原因保留；省纸/省时/自定义排序均正确`,
+    ms: Math.round(performance.now() - t0),
+  }
+}
+
 export async function runSelfTest(): Promise<AssertionResult[]> {
   const results: AssertionResult[] = []
   results.push(assertGuillotine())
@@ -501,5 +615,6 @@ export async function runSelfTest(): Promise<AssertionResult[]> {
     })
   }
   results.push(assertPerformance())
+  results.push(assertPaperTrial())
   return results
 }

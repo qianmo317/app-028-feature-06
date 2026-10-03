@@ -18,7 +18,7 @@ import { downloadBlob } from '../logic/image'
 import { findPhotoSize, resolvePaper } from '../logic/library'
 import { buildPdf } from '../logic/pdf'
 import { buildSheetPng } from '../logic/png'
-import { formatCents, formatPercent } from '../logic/units'
+import { formatCents, formatMeters, formatPercent } from '../logic/units'
 import type { Placement, Task } from '../logic/types'
 
 const route = useRoute()
@@ -154,7 +154,12 @@ function exportCost() {
     ['任务', t.name],
     ['相纸', c.paperName],
     ['相纸单价（元）', (paper.value.priceCents / 100).toFixed(2)],
-    ['用纸张数', c.sheets],
+    ...(c.usedLengthMm !== undefined
+      ? ([
+          ['用纸段数', c.sheets],
+          ['预估消耗（米）', (c.usedLengthMm / 1000).toFixed(2)],
+        ] as Array<Array<string | number>>)
+      : ([['用纸张数', c.sheets]] as Array<Array<string | number>>)),
     ['照片总数', c.totalPhotoCount],
     ['总材料成本（元）', (c.totalCents / 100).toFixed(2)],
     ['每张照片摊薄成本（元）', (c.perPhotoCents / 100).toFixed(4)],
@@ -251,9 +256,15 @@ function printView() {
           <h3>成本表</h3>
           <div v-if="cost" class="kv">
             <dt>相纸单价</dt>
-            <dd>{{ formatCents(paper.priceCents) }}/张</dd>
-            <dt>用纸张数</dt>
-            <dd>{{ cost.sheets }}</dd>
+            <dd>{{ formatCents(paper.priceCents) }}/{{ paper.kind === 'roll' ? '卷' : '张' }}</dd>
+            <template v-if="cost.usedLengthMm !== undefined">
+              <dt>预估消耗</dt>
+              <dd>{{ formatMeters(cost.usedLengthMm) }}（{{ cost.sheets }} 段）</dd>
+            </template>
+            <template v-else>
+              <dt>用纸张数</dt>
+              <dd>{{ cost.sheets }}</dd>
+            </template>
             <dt>总材料成本</dt>
             <dd>{{ formatCents(cost.totalCents) }}</dd>
             <dt>每张照片摊薄</dt>
